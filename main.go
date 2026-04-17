@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
+	"google.golang.org/protobuf/proto"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -57,7 +60,14 @@ func displayQRCode(code string) {
 func main() {
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
 	ctx := context.Background()
-	container, err := sqlstore.New(ctx, "sqlite3", "file:store.db?_foreign_keys=on", dbLog)
+		// Determine the path to the database file dynamically based on the binary location
+	exePath, _ := os.Executable()
+	dirPath := filepath.Dir(exePath)
+	dbPath := filepath.Join(dirPath, "store.db")
+	if customPath := os.Getenv("WSEND_DB_PATH"); customPath != "" {
+		dbPath = customPath
+	}
+	container, err := sqlstore.New(ctx, "sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
 	if err != nil {
 		panic(err)
 	}
@@ -100,14 +110,6 @@ func main() {
 			phoneNumber := os.Args[2]
 			message := os.Args[3]
 			sendMessage(phoneNumber, message)
-		} else if command == "send-file" && len(os.Args) >= 4 {
-			phoneNumber := os.Args[2]
-			filePath := os.Args[3]
-			caption := ""
-			if len(os.Args) > 4 {
-				caption = os.Args[4]
-			}
-			sendFile(phoneNumber, filePath, caption)
 		} else if command == "send-image" && len(os.Args) >= 4 {
 			phoneNumber := os.Args[2]
 			filePath := os.Args[3]
@@ -115,9 +117,42 @@ func main() {
 			if len(os.Args) > 4 {
 				caption = os.Args[4]
 			}
-			sendImage(phoneNumber, filePath, caption)
+			sendMedia(phoneNumber, filePath, caption, whatsmeow.MediaImage)
+		} else if command == "send-video" && len(os.Args) >= 4 {
+			phoneNumber := os.Args[2]
+			filePath := os.Args[3]
+			caption := ""
+			if len(os.Args) > 4 {
+				caption = os.Args[4]
+			}
+			sendMedia(phoneNumber, filePath, caption, whatsmeow.MediaVideo)
+		} else if command == "send-audio" && len(os.Args) >= 4 {
+			phoneNumber := os.Args[2]
+			filePath := os.Args[3]
+			sendMedia(phoneNumber, filePath, "", whatsmeow.MediaAudio)
+		} else if command == "send-file" && len(os.Args) >= 4 {
+			phoneNumber := os.Args[2]
+			filePath := os.Args[3]
+			caption := ""
+			if len(os.Args) > 4 {
+				caption = os.Args[4]
+			}
+			sendMedia(phoneNumber, filePath, caption, whatsmeow.MediaDocument)
 		} else {
-			printUsage()
+	// Determine contacts file path dynamically
+	exePath, _ := os.Executable()
+	dirPath := filepath.Dir(exePath)
+	contactsFile := filepath.Join(dirPath, "contacts.txt")
+	if customPath := os.Getenv("CONTACTS_FILE_PATH"); customPath != "" {
+		contactsFile = customPath
+	}
+	fmt.Printf("Resolved contacts.txt path: %s\n", contactsFile)
+	if _, err := os.Stat(contactsFile); err != nil {
+		fmt.Printf("Contacts file not found: %s\n", contactsFile)
+		os.Exit(1)
+	}
+
+	printUsage()
 		}
 		return
 	}
@@ -130,12 +165,15 @@ func printUsage() {
 	fmt.Println("  ./wsend                    - Login/scan QR code")
 	fmt.Println("  ./wsend send <phone> <msg>   - Send text message")
 	fmt.Println("  ./wsend send-image <phone> <file> [caption] - Send image")
-	fmt.Println("  ./wsend send-file <phone> <file> [caption]  - Send file/document")
+	fmt.Println("  ./wsend send-video <phone> <file> [caption] - Send video")
+	fmt.Println("  ./wsend send-audio <phone> <file>   - Send audio")
+	fmt.Println("  ./wsend send-file <phone> <file> [caption]  - Send document")
 	fmt.Println("\nExamples:")
 	fmt.Println("  ./wsend send 1234567890 \"Hello!\"")
 	fmt.Println("  ./wsend send-image 1234567890 photo.jpg \"Check this out\"")
+	fmt.Println("  ./wsend send-video 1234567890 video.mp4")
+	fmt.Println("  ./wsend send-audio 1234567890 voice.ogg")
 	fmt.Println("  ./wsend send-file 1234567890 document.pdf")
-	fmt.Println("\nWaiting for messages... Press Ctrl+C to exit")
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -160,7 +198,7 @@ func sendMessage(phoneNumber, message string) {
 	client.Disconnect()
 }
 
-func sendImage(phoneNumber, filePath, caption string) {
+func sendMedia(phoneNumber, filePath, caption string, mediaType whatsmeow.MediaType) {
 	recipient := types.NewJID(phoneNumber, "s.whatsapp.net")
 
 	data, err := os.ReadFile(filePath)
@@ -169,69 +207,118 @@ func sendImage(phoneNumber, filePath, caption string) {
 		return
 	}
 
-	uploaded, err := client.UploadMedia(context.Background(), data, whatsmeow.ImageMedia)
+	uploaded, err := client.Upload(context.Background(), data, mediaType)
 	if err != nil {
 		fmt.Printf("Error uploading media: %v\n", err)
 		return
 	}
 
-	msg := &waE2E.Message{
-		ImageMessage: &waE2E.ImageMessage{
-			URL:         &uploaded.URL,
-			DirectPath:  &uploaded.DirectPath,
-			MediaKey:    uploaded.MediaKey,
-			MimeType:    &uploaded.MimeType,
-			FileEncSHA256: uploaded.FileEncSHA256,
-			FileSHA256:   uploaded.FileSHA256,
-			FileName:    func() *string { s := filepath.Base(filePath); return &s }(),
-			Caption:     func() *string { if caption != "" { return &caption }; return nil }(),
-		},
+	mimeType := detectMimeType(filePath)
+	fileName := filepath.Base(filePath)
+
+	switch mediaType {
+	case whatsmeow.MediaImage:
+		msg := &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mimeType),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:   uploaded.FileSHA256,
+				FileLength:   proto.Uint64(uploaded.FileLength),
+			},
+		}
+		if caption != "" {
+			msg.ImageMessage.Caption = proto.String(caption)
+		}
+		_, err = client.SendMessage(context.Background(), recipient, msg)
+	case whatsmeow.MediaVideo:
+		msg := &waE2E.Message{
+			VideoMessage: &waE2E.VideoMessage{
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mimeType),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:   uploaded.FileSHA256,
+				FileLength:   proto.Uint64(uploaded.FileLength),
+			},
+		}
+		if caption != "" {
+			msg.VideoMessage.Caption = proto.String(caption)
+		}
+		_, err = client.SendMessage(context.Background(), recipient, msg)
+	case whatsmeow.MediaAudio:
+		msg := &waE2E.Message{
+			AudioMessage: &waE2E.AudioMessage{
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mimeType),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:   uploaded.FileSHA256,
+				FileLength:   proto.Uint64(uploaded.FileLength),
+			},
+		}
+		_, err = client.SendMessage(context.Background(), recipient, msg)
+	case whatsmeow.MediaDocument:
+		msg := &waE2E.Message{
+			DocumentMessage: &waE2E.DocumentMessage{
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mimeType),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:   uploaded.FileSHA256,
+				FileLength:   proto.Uint64(uploaded.FileLength),
+				FileName:     proto.String(fileName),
+			},
+		}
+		if caption != "" {
+			msg.DocumentMessage.Caption = proto.String(caption)
+		}
+		_, err = client.SendMessage(context.Background(), recipient, msg)
 	}
 
-	_, err = client.SendMessage(context.Background(), recipient, msg)
 	if err != nil {
-		fmt.Printf("Error sending image: %v\n", err)
+		fmt.Printf("Error sending media: %v\n", err)
 	} else {
-		fmt.Printf("Image sent to %s: %s\n", recipient, filePath)
+		fmt.Printf("Media sent to %s: %s\n", recipient, filePath)
 	}
 
 	client.Disconnect()
 }
 
-func sendFile(phoneNumber, filePath, caption string) {
-	recipient := types.NewJID(phoneNumber, "s.whatsapp.net")
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		fmt.Printf("Error reading file: %v\n", err)
-		return
+func detectMimeType(filePath string) string {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".mp4":
+		return "video/mp4"
+	case ".3gp":
+		return "video/3gpp"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".ogg":
+		return "audio/ogg; codecs=opus"
+	case ".pdf":
+		return "application/pdf"
+	case ".doc", ".docx":
+		return "application/msword"
+	case ".xls", ".xlsx":
+		return "application/vnd.ms-excel"
+	case ".zip":
+		return "application/zip"
+	default:
+		data, _ := os.ReadFile(filePath)
+		return http.DetectContentType(data)
 	}
-
-	uploaded, err := client.UploadMedia(context.Background(), data, whatsmeow.DocumentMedia)
-	if err != nil {
-		fmt.Printf("Error uploading media: %v\n", err)
-		return
-	}
-
-	msg := &waE2E.Message{
-		DocumentMessage: &waE2E.DocumentMessage{
-			URL:           &uploaded.URL,
-			DirectPath:    &uploaded.DirectPath,
-			MediaKey:      uploaded.MediaKey,
-			MimeType:      &uploaded.MimeType,
-			FileEncSHA256: uploaded.FileEncSHA256,
-			FileSHA256:   uploaded.FileSHA256,
-			FileName:     func() *string { s := filepath.Base(filePath); return &s }(),
-			Caption:      func() *string { if caption != "" { return &caption }; return nil }(),
-		},
-	}
-
-	_, err = client.SendMessage(context.Background(), recipient, msg)
-	if err != nil {
-		fmt.Printf("Error sending file: %v\n", err)
-	} else {
-		fmt.Printf("File sent to %s: %s\n", recipient, filePath)
-	}
-
-	client.Disconnect()
 }
