@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+CONTACTS_FILE="contacts.txt"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WSEND_BIN="$SCRIPT_DIR/wsend-bin"
+
+show_usage() {
+    cat << EOF
+Usage: ./wsend [-i] <command> [options]
+
+Commands:
+  send <phone> <message>           Send text message
+  send-image <phone> <file> [caption]   Send image
+  send-video <phone> <file> [caption]   Send video
+  send-audio <phone> <file>         Send audio
+  send-file <phone> <file> [caption]    Send document
+
+Interactive Mode (-i):
+  With -i, you'll be prompted to select a contact using fzf.
+  You can also pick a file using fzf.
+
+Examples:
+  ./wsend send 1234567890 "Hello!"
+  ./wsend -i send "Hello from shell!"
+  ./wsend -i send-image photo.jpg "Check this out"
+  ./wsend send-file -i document.pdf
+
+Note: Edit contacts.txt to add your contacts.
+Format: Name|PhoneNumber (one per line)
+EOF
+}
+
+pick_contact() {
+    if [[ ! -f "$CONTACTS_FILE" ]]; then
+        echo "Error: contacts.txt not found" >&2
+        exit 1
+    fi
+
+    local selected
+    selected=$(grep -v '^#' "$CONTACTS_FILE" | grep -v '^$' | awk -F'|' '{print $1 " | " $2}' | fzf --prompt="Select contact: " --height=~50% --border --header="Pick a contact" | awk -F' | ' '{print $NF}')
+
+    if [[ -z "$selected" ]]; then
+        echo "No contact selected" >&2
+        exit 1
+    fi
+
+    echo "$selected"
+}
+
+pick_file() {
+    local file
+    file=$(fzf --prompt="Select file: " --height=~50% --border --header="Pick a file" --title="File picker")
+    if [[ -z "$file" ]]; then
+        echo "No file selected" >&2
+        exit 1
+    fi
+    echo "$file"
+}
+
+interactive=false
+
+if [[ "$1" == "-i" ]]; then
+    interactive=true
+    shift
+fi
+
+if [[ $# -eq 0 ]]; then
+    show_usage
+    exit 0
+fi
+
+cmd="$1"
+shift
+
+if $interactive; then
+    case "$cmd" in
+        send)
+            phone=$(pick_contact)
+            message="$*"
+            if [[ -z "$message" ]]; then
+                echo -n "Enter message: "
+                read -r message
+            fi
+            exec $WSEND_BIN send "$phone" "$message"
+            ;;
+        send-image)
+            file="$1"
+            if [[ -z "$file" || "$file" == "-"* ]]; then
+                file=$(pick_file)
+            else
+                shift
+            fi
+            phone=$(pick_contact)
+            caption="$*"
+            exec $WSEND_BIN send-image "$phone" "$file" "$caption"
+            ;;
+        send-video)
+            file="$1"
+            if [[ -z "$file" || "$file" == "-"* ]]; then
+                file=$(pick_file)
+            else
+                shift
+            fi
+            phone=$(pick_contact)
+            caption="$*"
+            exec $WSEND_BIN send-video "$phone" "$file" "$caption"
+            ;;
+        send-audio)
+            file="$1"
+            if [[ -z "$file" || "$file" == "-"* ]]; then
+                file=$(pick_file)
+            else
+                shift
+            fi
+            phone=$(pick_contact)
+            exec $WSEND_BIN send-audio "$phone" "$file"
+            ;;
+        send-file)
+            file="$1"
+            if [[ -z "$file" || "$file" == "-"* ]]; then
+                file=$(pick_file)
+            else
+                shift
+            fi
+            phone=$(pick_contact)
+            caption="$*"
+            exec $WSEND_BIN send-file "$phone" "$file" "$caption"
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            show_usage
+            exit 1
+            ;;
+    esac
+else
+    exec $WSEND_BIN "$cmd" "$@"
+fi
